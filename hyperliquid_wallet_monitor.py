@@ -22,10 +22,8 @@ def md_escape(text: str) -> str:
 
 async def send_filtered_alert(session: aiohttp.ClientSession, log_line: str, ticker: str):
     """Sends a beautifully formatted Markdown alert directly to your Telegram bot."""
-    # FIXED: Corrected endpoint path
     url = f"https://telegram.org{TELEGRAM_BOT_TOKEN}/sendMessage"
     
-    # FIXED: Re-enabled the active message payload string construct
     msg = (
         f"🚨 *Watchlist Confluence Target*\n\n"
         f"🪙 *Asset:* `{md_escape(ticker)}`\n"
@@ -44,20 +42,28 @@ async def send_filtered_alert(session: aiohttp.ClientSession, log_line: str, tic
             if response.status != 200:
                 resp_text = await response.text()
                 sys.stderr.write(f"Telegram API Error: {response.status} - {resp_text}\n")
+                sys.stderr.flush()
     except Exception as e:
         sys.stderr.write(f"Network Error sending to Telegram: {str(e)}\n")
+        sys.stderr.flush()
 
 async def keep_alive_ping(ws: aiohttp.ClientWebSocketResponse):
-    """Sends a mandatory heartbeat frame every 30 seconds to prevent connection drops."""
+    """Sends a mandatory heartbeat frame every 25 seconds to prevent connection drops."""
     try:
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(25)  # Drop to 25 seconds to beat the 60s timeout safely
             if not ws.closed:
-                await ws.send_json({"method": "ping"})
+                # Force raw string sending to bypass internal json buffering bugs
+                await ws.send_str('{"method": "ping"}')
+                
+                # Print to stdout explicitly so we can see it on Railway!
                 sys.stdout.write("[INFO] Sent WebSocket Heartbeat (ping)\n")
                 sys.stdout.flush()
     except asyncio.CancelledError:
         pass
+    except Exception as e:
+        sys.stderr.write(f"[ERROR] Ping loop exception encountered: {str(e)}\n")
+        sys.stderr.flush()
 
 async def handle_websocket_stream():
     score_pattern = re.compile(r"Score\s*[:=]\s*([0-9.]+)", re.IGNORECASE)
@@ -69,6 +75,7 @@ async def handle_websocket_stream():
         
         async with session.ws_connect(HYPERLIQUID_WS_URL) as ws:
             sys.stdout.write("[INFO] WebSocket Pipeline Connected Successfully!\n")
+            sys.stdout.flush()
             
             # Subscribe to the target channel (webData2 for an active address profile)
             subscribe_msg = {
