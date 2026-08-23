@@ -46,9 +46,20 @@ def _short_addr(addr: str) -> str:
 
 
 def _fmt_usd(value: float) -> str:
-    if abs(value) >= 1000:
+    value = abs(value)
+    if value >= 1_000_000:
+        return f"${value / 1_000_000:,.2f}M"
+    if value >= 1000:
         return f"${value / 1000:,.2f}K"
     return f"${value:,.2f}"
+
+
+def _sign(x: float) -> int:
+    if x > 0:
+        return 1
+    if x < 0:
+        return -1
+    return 0
 
 
 def update_entry_price_cache(web_data2: dict, entry_px_by_coin: dict) -> None:
@@ -78,7 +89,6 @@ def build_fill_alert(fill: dict, entry_px_by_coin: dict) -> str:
     px = float(fill.get("px", 0))
     sz = float(fill.get("sz", 0))
     side = fill.get("side", "B")
-    dir_label = fill.get("dir", "Trade")
     start_position = float(fill.get("startPosition", 0) or 0)
 
     signed_sz = sz if side == "B" else -sz
@@ -87,12 +97,32 @@ def build_fill_alert(fill: dict, entry_px_by_coin: dict) -> str:
     side_word = "LONG" if new_position >= 0 else "SHORT"
     icon = "🟢" if side_word == "LONG" else "🔴"
 
+    # Action dynamics: a brand-new position (no prior exposure) is "Open"; growing an
+    # existing position in the same direction is "Added". Reduces/closes/flips keep
+    # Hyperliquid's own `dir` label (e.g. "Close Long"), since those aren't opens/adds.
+    start_sign = _sign(start_position)
+    fill_sign = _sign(signed_sz)
+    is_new_position = start_sign == 0
+    is_same_direction_increase = (
+        not is_new_position
+        and start_sign == fill_sign
+        and abs(new_position) > abs(start_position)
+    )
+    if is_new_position:
+        action_text = f"Open {side_word.capitalize()}"
+    elif is_same_direction_increase:
+        action_text = f"Added {side_word.capitalize()}"
+    else:
+        action_text = fill.get("dir", "Trade")
+
+    # abs() here (and on total_size below) so a short's negative signed size never
+    # leaks a "-" into the notional-value currency formatting.
     total_size = abs(new_position)
-    notional = total_size * px
+    notional = abs(total_size * px)
     avg_entry = entry_px_by_coin.get(coin, px)
 
     line1 = f"whale 1 \\({md_escape(_short_addr(TARGET_ADDRESS))}\\)"
-    line2 = f"{md_escape(dir_label)} {md_escape(coin)} {icon} by {md_escape(f'{sz:.5f}')} @ {md_escape(f'{px:,.0f}')}"
+    line2 = f"{md_escape(action_text)} {md_escape(coin)} {icon} by {md_escape(f'{sz:.5f}')} @ {md_escape(f'{px:,.0f}')}"
     line3 = (
         f"Total Size: {md_escape(f'{total_size:.5f}')} "
         f"\\({md_escape(_fmt_usd(notional))}\\) \\| "
