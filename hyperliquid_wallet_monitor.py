@@ -62,6 +62,16 @@ def _sign(x: float) -> int:
     return 0
 
 
+def _fmt_num(value: float, decimals: int = 5) -> str:
+    """Thousands-separated number, trimming trailing zeros/decimal point. Replaces the old
+    `f'{value:,.0f}'` calls, which silently rounded any sub-$1 price (e.g. 0.21167) down to
+    the string "0" -- the "@ 0" / "Avg Entry: 0" display bug."""
+    s = f"{value:,.{decimals}f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s if s not in ("", "-") else "0"
+
+
 def update_entry_price_cache(web_data2: dict, entry_px_by_coin: dict) -> None:
     """Refreshes coin -> avg entry price from a webData2 snapshot, in place."""
     for entry in web_data2.get("clearinghouseState", {}).get("assetPositions", []):
@@ -80,7 +90,8 @@ def build_fill_alert(fill: dict, entry_px_by_coin: dict) -> str:
 
     Hyperliquid fill fields used: coin, px (fill price), sz (fill size),
     side ("B"=buy/"A"=sell), dir (human label e.g. "Open Long", "Close Short"),
-    startPosition (signed position size *before* this fill).
+    startPosition (signed position size *before* this fill), closedPnl (realized PNL
+    on this fill -- 0/absent on opens and same-direction adds).
 
     Avg entry price comes from the side-by-side webData2 snapshot cache since
     individual fills don't carry the account's running average entry price.
@@ -90,6 +101,7 @@ def build_fill_alert(fill: dict, entry_px_by_coin: dict) -> str:
     sz = float(fill.get("sz", 0))
     side = fill.get("side", "B")
     start_position = float(fill.get("startPosition", 0) or 0)
+    closed_pnl = float(fill.get("closedPnl", 0) or 0)
 
     signed_sz = sz if side == "B" else -sz
     new_position = start_position + signed_sz
@@ -98,8 +110,8 @@ def build_fill_alert(fill: dict, entry_px_by_coin: dict) -> str:
     icon = "🟢" if side_word == "LONG" else "🔴"
 
     # Action dynamics: a brand-new position (no prior exposure) is "Open"; growing an
-    # existing position in the same direction is "Added". Reduces/closes/flips keep
-    # Hyperliquid's own `dir` label (e.g. "Close Long"), since those aren't opens/adds.
+    # existing position in the same direction is "Added". Anything else is a reduce/close,
+    # handled separately below (it needs the pre-fill side, PNL, and a partial/full split).
     start_sign = _sign(start_position)
     fill_sign = _sign(signed_sz)
     is_new_position = start_sign == 0
@@ -108,28 +120,46 @@ def build_fill_alert(fill: dict, entry_px_by_coin: dict) -> str:
         and start_sign == fill_sign
         and abs(new_position) > abs(start_position)
     )
-    if is_new_position:
-        action_text = f"Open {side_word.capitalize()}"
-    elif is_same_direction_increase:
-        action_text = f"Added {side_word.capitalize()}"
-    else:
-        action_text = fill.get("dir", "Trade")
 
-    # abs() here (and on total_size below) so a short's negative signed size never
+    # abs() here (and on remaining_size below) so a short's negative signed size never
     # leaks a "-" into the notional-value currency formatting.
-    total_size = abs(new_position)
-    notional = abs(total_size * px)
+    remaining_size = abs(new_position)
+    notional = abs(remaining_size * px)
     avg_entry = entry_px_by_coin.get(coin, px)
 
     line1 = f"whale 1 \\({md_escape(_short_addr(TARGET_ADDRESS))}\\)"
-    line2 = f"{md_escape(action_text)} {md_escape(coin)} {icon} by {md_escape(f'{sz:.5f}')} @ {md_escape(f'{px:,.0f}')}"
-    line3 = (
-        f"Total Size: {md_escape(f'{total_size:.5f}')} "
-        f"\\({md_escape(_fmt_usd(notional))}\\) \\| "
-        f"Avg Entry: {md_escape(f'{avg_entry:,.0f}')}"
-    )
 
-    return f"{line1}\n{line2}\n{line3}"
+    if is_new_position or is_same_direction_increase:
+        action_text = f"Open {side_word.capitalize()}" if is_new_position else f"Added {side_word.capitalize()}"
+        line2 = (
+            f"{md_escape(action_text)} {md_escape(coin)} {icon} by "
+            f"{md_escape(_fmt_num(sz))} @ {md_escape(_fmt_num(px))}"
+        )
+        line3 = (
+            f"Total Size: {md_escape(_fmt_num(remaining_size))} "
+            f"\\({md_escape(_fmt_usd(notional))}\\) \\| "
+            f"Avg Entry: {md_escape(_fmt_num(avg_entry))}"
+        )
+        return f"{line1}\n{line2}\n{line3}"
+
+    # Reduce or full close. The side being reduced is the position's side *before* this
+    # fill (start_position's sign) -- new_position's sign/word is meaningless on a full
+    # close since new_position is 0 there.
+    reduce_side_word = "LONG" if start_sign >= 0 else "SHORT"
+    is_full_close = remaining_size < 1e-9
+    action_text = f"{'Closed' if is_full_close else 'Reduced'} {coin} {reduce_side_word}"
+
+    pnl_icon = "✅" if closed_pnl >= 0 else "❌"
+    pnl_sign = "+" if closed_pnl >= 0 else "-"
+
+    line2 = f"{md_escape(action_text)} by {md_escape(_fmt_num(sz))} @ ${md_escape(_fmt_num(px))}"
+    line3 = f"Closed PNL: {pnl_sign}${md_escape(_fmt_num(abs(closed_pnl)))} {pnl_icon}"
+    line4 = (
+        f"Remaining Size: {md_escape(_fmt_num(remaining_size))} "
+        f"\\({md_escape(_fmt_usd(notional))}\\) \\| "
+        f"Avg Entry: ${md_escape(_fmt_num(avg_entry))}"
+    )
+    return f"{line1}\n{line2}\n{line3}\n{line4}"
 
 async def keep_alive_ping(ws: aiohttp.ClientWebSocketResponse):
     """Sends a mandatory heartbeat frame every 25 seconds to prevent connection drops."""
