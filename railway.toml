@@ -1,0 +1,21 @@
+# Railway deploy config for the Hyperliquid wallet tracker worker.
+#
+# Volumes and variables aren't declarable from this file -- Railway only supports setting
+# them via the dashboard (Settings > Volumes / Variables) or an authenticated `railway`
+# CLI session. Documenting the required setup here so it survives a redeploy or a new
+# person picking up this service:
+#
+#   1. Settings > Volumes > New Volume, mount path: /data
+#   2. Variables: TRACKER_STATE_FILE=/data/tracker_state.json
+#
+# Without both of those, tracker_state.json falls back to the service's local (ephemeral)
+# filesystem path and the crash/restart resilience in hyperliquid_wallet_monitor.py's
+# state-persistence layer is lost on every redeploy.
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python hyperliquid_wallet_monitor.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

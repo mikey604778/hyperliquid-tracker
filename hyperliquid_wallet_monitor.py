@@ -23,7 +23,12 @@ RECONNECT_MAX_DELAY = 60
 # real userFills alert, before trusting that userFills truly dropped it and firing a
 # synthetic fallback alert instead. Long enough to let an in-flight fill message land,
 # short enough that the fallback still reads as "real time".
-FALLBACK_GRACE_SECONDS = 2.0
+FALLBACK_GRACE_SECONDS = 4.0
+
+# Where the position cache is persisted across restarts, so a Railway redeploy/crash
+# doesn't silently re-baseline (and thus swallow) a position change that happened while
+# the process was down. Relative to the working directory the service runs from.
+STATE_FILE_PATH = os.environ.get("TRACKER_STATE_FILE", "tracker_state.json")
 
 # ==============================================================================
 def md_escape(text: str) -> str:
@@ -83,13 +88,59 @@ def _fmt_num(value: float, decimals: int = 5) -> str:
     return s if s not in ("", "-") else "0"
 
 
+def _load_persisted_state() -> dict | None:
+    """Reads the on-disk position snapshot from the previous run, if any. Returns None on
+    a fresh install/first-ever boot (no file) or a corrupt/unreadable file -- either way
+    the caller falls back to a normal cold bootstrap."""
+    try:
+        with open(STATE_FILE_PATH, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except (json.JSONDecodeError, OSError) as e:
+        sys.stderr.write(f"[WARN] Could not read {STATE_FILE_PATH}: {e}. Starting cold.\n")
+        sys.stderr.flush()
+        return None
+
+
+def save_state(state: dict) -> None:
+    """Persists the position cache to disk so a container restart/crash-loop can restore
+    it instead of silently re-baselining on the next webData2 snapshot. Written atomically
+    (temp file + os.replace) so a crash mid-write never corrupts the file that's read on
+    the next boot. Best-effort: a write failure is logged, never fatal."""
+    snapshot = {
+        "entry_by_coin": state["entry_by_coin"],
+        "last_entry_by_coin": state["last_entry_by_coin"],
+        "size_by_coin": state["size_by_coin"],
+        "mark_by_coin": state["mark_by_coin"],
+        "confirmed_size_by_coin": state["confirmed_size_by_coin"],
+    }
+    tmp_path = f"{STATE_FILE_PATH}.tmp"
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(snapshot, f)
+        os.replace(tmp_path, STATE_FILE_PATH)
+    except OSError as e:
+        sys.stderr.write(f"[WARN] Could not persist state to {STATE_FILE_PATH}: {e}\n")
+        sys.stderr.flush()
+
+
 def new_tracker_state() -> dict:
     """Creates the persistent cross-reconnect state blob threaded through the whole run.
     Living at main()'s level (not inside handle_websocket_stream) means a dropped/rebuilt
     WebSocket connection never resets it -- so if userFills genuinely drops a fill while
     disconnected, the very next webData2 snapshot after reconnect still catches the size
-    mismatch and the fallback engine below fires for it."""
-    return {
+    mismatch and the fallback engine below fires for it.
+
+    Also restores from STATE_FILE_PATH (written by save_state) when present, so a Railway
+    redeploy or crash-loop restart -- which wipes the in-memory dict above -- doesn't lose
+    the account's last-known position state too. A coin restored this way is pre-marked
+    "bootstrapped" with its saved size as the confirmed baseline, so the very first
+    webData2 snapshot after boot runs through the normal mismatch check (not the silent
+    first-sighting bootstrap path) and fires a real fallback alert if the position moved
+    while the process was down."""
+    disk_state = _load_persisted_state()
+    state = {
         "entry_by_coin": {},       # coin -> current avg entry px (deleted when flat, like before)
         "last_entry_by_coin": {},  # coin -> most recent non-null avg entry px (never deleted;
                                     # needed as the PNL basis for a fallback alert that fires
@@ -102,6 +153,21 @@ def new_tracker_state() -> dict:
                                     # alerting on process startup for pre-existing positions)
         "pending_fallback": {},    # coin -> in-flight asyncio.Task from schedule_fallback_check
     }
+
+    if disk_state:
+        state["entry_by_coin"].update(disk_state.get("entry_by_coin", {}))
+        state["last_entry_by_coin"].update(disk_state.get("last_entry_by_coin", {}))
+        state["size_by_coin"].update(disk_state.get("size_by_coin", {}))
+        state["mark_by_coin"].update(disk_state.get("mark_by_coin", {}))
+        state["confirmed_size_by_coin"].update(disk_state.get("confirmed_size_by_coin", {}))
+        state["bootstrapped"].update(state["confirmed_size_by_coin"].keys())
+        sys.stdout.write(
+            f"[INFO] Restored position state from {STATE_FILE_PATH} for coins: "
+            f"{sorted(state['confirmed_size_by_coin'].keys())}\n"
+        )
+        sys.stdout.flush()
+
+    return state
 
 
 def update_position_cache(web_data2: dict, state: dict) -> None:
@@ -342,6 +408,7 @@ async def _fallback_check_after_delay(coin: str, state: dict, session: aiohttp.C
         if alert_text:
             await send_telegram_message(session, alert_text)
         state["confirmed_size_by_coin"][coin] = new_szi
+        save_state(state)
     except asyncio.CancelledError:
         pass
     except Exception as e:
@@ -437,6 +504,7 @@ async def handle_websocket_stream(state: dict):
                             update_position_cache(web_data2, state)
                             for coin in list(state["size_by_coin"].keys()):
                                 maybe_schedule_fallback(coin, state, session)
+                            save_state(state)
                             continue
 
                         if channel != "userFills":
@@ -471,6 +539,7 @@ async def handle_websocket_stream(state: dict):
                                 start_position = float(fill.get("startPosition", 0) or 0)
                                 signed_sz = sz if side == "B" else -sz
                                 state["confirmed_size_by_coin"][coin] = start_position + signed_sz
+                                save_state(state)
 
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                         break
