@@ -114,6 +114,8 @@ def save_state(state: dict) -> None:
         "size_by_coin": state["size_by_coin"],
         "mark_by_coin": state["mark_by_coin"],
         "confirmed_size_by_coin": state["confirmed_size_by_coin"],
+        "last_fill_time": state["last_fill_time"],
+        "last_fill_tid": state["last_fill_tid"],
     }
     tmp_path = f"{STATE_FILE_PATH}.tmp"
     try:
@@ -152,6 +154,12 @@ def new_tracker_state() -> dict:
         "bootstrapped": set(),     # coins whose first-ever snapshot we've baselined (skip
                                     # alerting on process startup for pre-existing positions)
         "pending_fallback": {},    # coin -> in-flight asyncio.Task from schedule_fallback_check
+        "last_fill_time": 0.0,     # (time, tid) watermark of the newest fill we've already
+        "last_fill_tid": 0,        # alerted on -- see maybe-alert logic in the userFills
+                                    # handler below. Lets a reconnect's isSnapshot replay
+                                    # (which includes any fills that happened while the
+                                    # socket was down) be diffed against this and alerted
+                                    # on, instead of being discarded as "just history".
     }
 
     if disk_state:
@@ -161,6 +169,8 @@ def new_tracker_state() -> dict:
         state["mark_by_coin"].update(disk_state.get("mark_by_coin", {}))
         state["confirmed_size_by_coin"].update(disk_state.get("confirmed_size_by_coin", {}))
         state["bootstrapped"].update(state["confirmed_size_by_coin"].keys())
+        state["last_fill_time"] = disk_state.get("last_fill_time", 0.0)
+        state["last_fill_tid"] = disk_state.get("last_fill_tid", 0)
         sys.stdout.write(
             f"[INFO] Restored position state from {STATE_FILE_PATH} for coins: "
             f"{sorted(state['confirmed_size_by_coin'].keys())}\n"
@@ -224,6 +234,13 @@ def update_entry_price_cache(web_data2: dict, entry_px_by_coin: dict) -> None:
             entry_px_by_coin[coin] = float(entry_px)
         elif coin and coin in entry_px_by_coin:
             del entry_px_by_coin[coin]
+
+
+def _fill_key(fill: dict) -> tuple[float, int]:
+    """Sort/comparison key for a userFills entry: (time, tid). Used to diff a batch of
+    fills against the state's last-alerted watermark, so a reconnect's isSnapshot replay
+    can be told apart from genuinely already-seen fills."""
+    return (float(fill.get("time", 0) or 0), int(fill.get("tid", 0) or 0))
 
 
 def build_fill_alert(fill: dict, entry_px_by_coin: dict) -> str:
@@ -512,22 +529,48 @@ async def handle_websocket_stream(state: dict):
 
                         payload = data.get("data", {})
                         fills = payload.get("fills", [])
+                        is_snapshot = payload.get("isSnapshot", False)
+                        watermark = (state["last_fill_time"], state["last_fill_tid"])
 
-                        if payload.get("isSnapshot"):
-                            # Initial batch is trade history on connect, not new
-                            # activity — record it but don't alert retroactively.
+                        if is_snapshot and watermark == (0.0, 0):
+                            # Genuinely first-ever connection for this state (no prior
+                            # watermark, from this run or a restored disk snapshot) --
+                            # this batch is pre-existing trade history, not new activity.
+                            # Baseline the watermark from it silently instead of alerting
+                            # retroactively on the account's whole history.
+                            if fills:
+                                newest = max(fills, key=_fill_key)
+                                state["last_fill_time"], state["last_fill_tid"] = _fill_key(newest)
                             sys.stdout.write(
                                 f"[INFO] Baseline fill history received: {len(fills)} fill(s)\n"
                             )
                             sys.stdout.flush()
+                            save_state(state)
                             continue
 
-                        # Every fill in the payload is alerted on -- opens, adds, partial
-                        # reduces, full closes, and liquidations alike. There is no dir-based
-                        # filter here that could silently drop one.
-                        for fill in fills:
+                        # Every fill newer than our watermark is alerted on -- opens, adds,
+                        # partial reduces, full closes, and liquidations alike, whether they
+                        # arrived as live pushes or bundled into a reconnect's isSnapshot
+                        # replay (which is exactly how fills that happened while the socket
+                        # was down come back to us -- treating those as "just history" was
+                        # silently dropping any reduce/close that occurred during a drop).
+                        # There is no dir-based filter here that could silently skip one.
+                        new_fills = sorted(
+                            (f for f in fills if _fill_key(f) > watermark),
+                            key=_fill_key,
+                        )
+                        if is_snapshot and new_fills:
+                            sys.stdout.write(
+                                f"[INFO] Reconnect snapshot contained {len(new_fills)} fill(s) "
+                                f"newer than our last watermark -- alerting on them now.\n"
+                            )
+                            sys.stdout.flush()
+
+                        for fill in new_fills:
                             alert_text = build_fill_alert(fill, entry_px_by_coin)
                             await send_telegram_message(session, alert_text)
+
+                            state["last_fill_time"], state["last_fill_tid"] = _fill_key(fill)
 
                             # Mark this size change as accounted for, so the fallback
                             # engine (driven by the next webData2 tick) doesn't also
@@ -539,7 +582,7 @@ async def handle_websocket_stream(state: dict):
                                 start_position = float(fill.get("startPosition", 0) or 0)
                                 signed_sz = sz if side == "B" else -sz
                                 state["confirmed_size_by_coin"][coin] = start_position + signed_sz
-                                save_state(state)
+                            save_state(state)
 
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                         break
