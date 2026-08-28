@@ -243,7 +243,7 @@ def _fill_key(fill: dict) -> tuple[float, int]:
     return (float(fill.get("time", 0) or 0), int(fill.get("tid", 0) or 0))
 
 
-def build_fill_alert(fill: dict, entry_px_by_coin: dict) -> str:
+def build_fill_alert(fill: dict, entry_px_by_coin: dict, mark_by_coin: dict | None = None) -> str:
     """Formats a single userFills entry exactly like the reference tracker bot.
 
     Hyperliquid fill fields used: coin, px (fill price), sz (fill size),
@@ -254,12 +254,21 @@ def build_fill_alert(fill: dict, entry_px_by_coin: dict) -> str:
     Avg entry price comes from the side-by-side webData2 snapshot cache since
     individual fills don't carry the account's running average entry price.
 
+    A snapshot-replayed fill (isSnapshot batch on reconnect) occasionally carries a
+    zeroed-out px, or arrives for a coin entry_px_by_coin has no baseline for yet --
+    both render as the "@ 0" / "Avg Entry: 0" bug. mark_by_coin (the live webData2 oracle
+    mark cache, keyed by coin) is used as the substitute for either field in that case, so
+    the alert always shows a real price instead of a literal zero.
+
     Any size change reported by this fill (open, add, reduce, close, liquidation --
     Hyperliquid tags all of these on the same userFills stream) is rendered here; there
     is no dir-based allow-list that could silently drop one.
     """
+    mark_by_coin = mark_by_coin or {}
     coin = fill.get("coin", "?")
-    px = float(fill.get("px", 0))
+    px = float(fill.get("px", 0) or 0)
+    if px <= 0:
+        px = mark_by_coin.get(coin) or 0.0
     sz = float(fill.get("sz", 0))
     side = fill.get("side", "B")
     start_position = float(fill.get("startPosition", 0) or 0)
@@ -287,7 +296,7 @@ def build_fill_alert(fill: dict, entry_px_by_coin: dict) -> str:
     # leaks a "-" into the notional-value currency formatting.
     remaining_size = abs(new_position)
     notional = abs(remaining_size * px)
-    avg_entry = entry_px_by_coin.get(coin, px)
+    avg_entry = entry_px_by_coin.get(coin) or mark_by_coin.get(coin) or px
 
     line1 = f"whale 1 \\({md_escape(_short_addr(TARGET_ADDRESS))}\\)"
 
@@ -567,7 +576,7 @@ async def handle_websocket_stream(state: dict):
                             sys.stdout.flush()
 
                         for fill in new_fills:
-                            alert_text = build_fill_alert(fill, entry_px_by_coin)
+                            alert_text = build_fill_alert(fill, entry_px_by_coin, state["mark_by_coin"])
                             await send_telegram_message(session, alert_text)
 
                             state["last_fill_time"], state["last_fill_tid"] = _fill_key(fill)
