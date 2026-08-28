@@ -12,9 +12,6 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 HYPERLIQUID_WS_URL = "wss://api.hyperliquid.xyz/ws"
 
-# Track an observed account, configured via Railway environment variable
-TARGET_ADDRESS = os.environ["HYPERLIQUID_WALLET_ADDRESS"]
-
 # Reconnect backoff bounds (seconds) -- see main().
 RECONNECT_BASE_DELAY = 1
 RECONNECT_MAX_DELAY = 60
@@ -25,10 +22,48 @@ RECONNECT_MAX_DELAY = 60
 # short enough that the fallback still reads as "real time".
 FALLBACK_GRACE_SECONDS = 4.0
 
-# Where the position cache is persisted across restarts, so a Railway redeploy/crash
-# doesn't silently re-baseline (and thus swallow) a position change that happened while
-# the process was down. Relative to the working directory the service runs from.
-STATE_FILE_PATH = os.environ.get("TRACKER_STATE_FILE", "tracker_state.json")
+# Base path for the persisted position cache -- each tracked wallet gets its own file
+# (e.g. tracker_state.418aa688.json) derived from this, via _state_file_for(). Relative
+# to the working directory the service runs from unless pointed at a mounted volume.
+STATE_FILE_BASE = os.environ.get("TRACKER_STATE_FILE", "tracker_state.json")
+
+
+def _state_file_for(address: str) -> str:
+    """Per-wallet state file path, so tracking multiple wallets never has one clobber
+    another's persisted position cache on the same volume."""
+    root, ext = os.path.splitext(STATE_FILE_BASE)
+    return f"{root}.{address[2:10].lower()}{ext}"
+
+
+def get_tracked_wallets() -> list[dict]:
+    """Reads the list of wallets to track from environment variables: WALLET_<N>_LABEL /
+    WALLET_<N>_ADDRESS for N = 1, 2, 3, ... stopping at the first missing address. Slot 1
+    falls back to the legacy HYPERLIQUID_WALLET_ADDRESS var (and "Medium Whale 1" as its
+    label) so existing Railway configs keep working unchanged. Slot 2 defaults to the
+    address the user asked to add ("Big Whale 2") if WALLET_2_ADDRESS isn't set, so it
+    works immediately without a Railway variable -- add WALLET_2_ADDRESS on Railway too if
+    you want it configurable without a code change later."""
+    wallets = []
+
+    default_addresses = {
+        1: os.environ.get("HYPERLIQUID_WALLET_ADDRESS"),
+        2: "0x418aa6bf98a2b2bc93779f810330d88cde488888",
+    }
+    default_labels = {
+        1: "Medium Whale 1",
+        2: "Big Whale 2",
+    }
+
+    n = 1
+    while True:
+        address = os.environ.get(f"WALLET_{n}_ADDRESS", default_addresses.get(n))
+        if not address:
+            break
+        label = os.environ.get(f"WALLET_{n}_LABEL", default_labels.get(n, f"Whale {n}"))
+        wallets.append({"label": label, "address": address})
+        n += 1
+
+    return wallets
 
 # ==============================================================================
 def md_escape(text: str) -> str:
@@ -88,17 +123,17 @@ def _fmt_num(value: float, decimals: int = 5) -> str:
     return s if s not in ("", "-") else "0"
 
 
-def _load_persisted_state() -> dict | None:
+def _load_persisted_state(state_file_path: str) -> dict | None:
     """Reads the on-disk position snapshot from the previous run, if any. Returns None on
     a fresh install/first-ever boot (no file) or a corrupt/unreadable file -- either way
     the caller falls back to a normal cold bootstrap."""
     try:
-        with open(STATE_FILE_PATH, "r") as f:
+        with open(state_file_path, "r") as f:
             return json.load(f)
     except FileNotFoundError:
         return None
     except (json.JSONDecodeError, OSError) as e:
-        sys.stderr.write(f"[WARN] Could not read {STATE_FILE_PATH}: {e}. Starting cold.\n")
+        sys.stderr.write(f"[WARN] Could not read {state_file_path}: {e}. Starting cold.\n")
         sys.stderr.flush()
         return None
 
@@ -108,6 +143,7 @@ def save_state(state: dict) -> None:
     it instead of silently re-baselining on the next webData2 snapshot. Written atomically
     (temp file + os.replace) so a crash mid-write never corrupts the file that's read on
     the next boot. Best-effort: a write failure is logged, never fatal."""
+    state_file_path = state["state_file_path"]
     snapshot = {
         "entry_by_coin": state["entry_by_coin"],
         "last_entry_by_coin": state["last_entry_by_coin"],
@@ -117,32 +153,36 @@ def save_state(state: dict) -> None:
         "last_fill_time": state["last_fill_time"],
         "last_fill_tid": state["last_fill_tid"],
     }
-    tmp_path = f"{STATE_FILE_PATH}.tmp"
+    tmp_path = f"{state_file_path}.tmp"
     try:
         with open(tmp_path, "w") as f:
             json.dump(snapshot, f)
-        os.replace(tmp_path, STATE_FILE_PATH)
+        os.replace(tmp_path, state_file_path)
     except OSError as e:
-        sys.stderr.write(f"[WARN] Could not persist state to {STATE_FILE_PATH}: {e}\n")
+        sys.stderr.write(f"[WARN] Could not persist state to {state_file_path}: {e}\n")
         sys.stderr.flush()
 
 
-def new_tracker_state() -> dict:
+def new_tracker_state(label: str, address: str) -> dict:
     """Creates the persistent cross-reconnect state blob threaded through the whole run.
     Living at main()'s level (not inside handle_websocket_stream) means a dropped/rebuilt
     WebSocket connection never resets it -- so if userFills genuinely drops a fill while
     disconnected, the very next webData2 snapshot after reconnect still catches the size
     mismatch and the fallback engine below fires for it.
 
-    Also restores from STATE_FILE_PATH (written by save_state) when present, so a Railway
+    Also restores from this wallet's state file (written by save_state) when present, so a Railway
     redeploy or crash-loop restart -- which wipes the in-memory dict above -- doesn't lose
     the account's last-known position state too. A coin restored this way is pre-marked
     "bootstrapped" with its saved size as the confirmed baseline, so the very first
     webData2 snapshot after boot runs through the normal mismatch check (not the silent
     first-sighting bootstrap path) and fires a real fallback alert if the position moved
     while the process was down."""
-    disk_state = _load_persisted_state()
+    state_file_path = _state_file_for(address)
+    disk_state = _load_persisted_state(state_file_path)
     state = {
+        "label": label,            # human-readable name shown in alerts, e.g. "Big Whale 2"
+        "address": address,        # the wallet address this state/stream tracks
+        "state_file_path": state_file_path,
         "entry_by_coin": {},       # coin -> current avg entry px (deleted when flat, like before)
         "last_entry_by_coin": {},  # coin -> most recent non-null avg entry px (never deleted;
                                     # needed as the PNL basis for a fallback alert that fires
@@ -172,7 +212,7 @@ def new_tracker_state() -> dict:
         state["last_fill_time"] = disk_state.get("last_fill_time", 0.0)
         state["last_fill_tid"] = disk_state.get("last_fill_tid", 0)
         sys.stdout.write(
-            f"[INFO] Restored position state from {STATE_FILE_PATH} for coins: "
+            f"[INFO] [{label}] Restored position state from {state_file_path} for coins: "
             f"{sorted(state['confirmed_size_by_coin'].keys())}\n"
         )
         sys.stdout.flush()
@@ -243,7 +283,10 @@ def _fill_key(fill: dict) -> tuple[float, int]:
     return (float(fill.get("time", 0) or 0), int(fill.get("tid", 0) or 0))
 
 
-def build_fill_alert(fill: dict, entry_px_by_coin: dict, mark_by_coin: dict | None = None) -> str:
+def build_fill_alert(
+    fill: dict, entry_px_by_coin: dict, mark_by_coin: dict | None = None,
+    label: str = "whale 1", address: str = "",
+) -> str:
     """Formats a single userFills entry exactly like the reference tracker bot.
 
     Hyperliquid fill fields used: coin, px (fill price), sz (fill size),
@@ -298,7 +341,7 @@ def build_fill_alert(fill: dict, entry_px_by_coin: dict, mark_by_coin: dict | No
     notional = abs(remaining_size * px)
     avg_entry = entry_px_by_coin.get(coin) or mark_by_coin.get(coin) or px
 
-    line1 = f"whale 1 \\({md_escape(_short_addr(TARGET_ADDRESS))}\\)"
+    line1 = f"{md_escape(label)} \\({md_escape(_short_addr(address))}\\)"
 
     if is_new_position or is_same_direction_increase:
         action_text = f"Open {side_word.capitalize()}" if is_new_position else f"Added {side_word.capitalize()}"
@@ -358,7 +401,7 @@ def build_fallback_alert(coin: str, old_szi: float, new_szi: float, state: dict)
     if mark_px is None or mark_px <= 0:
         return None
 
-    line1 = f"whale 1 \\({md_escape(_short_addr(TARGET_ADDRESS))}\\)"
+    line1 = f"{md_escape(state['label'])} \\({md_escape(_short_addr(state['address']))}\\)"
 
     # Case 1: reduce or full close -- magnitude shrank, same side (or now fully flat).
     if old_sign != 0 and abs(new_szi) < abs(old_szi) - 1e-9 and (new_sign == old_sign or new_szi == 0):
@@ -426,7 +469,7 @@ async def _fallback_check_after_delay(coin: str, state: dict, session: aiohttp.C
         if abs(new_szi - confirmed) < 1e-9:
             return  # a real fill alert already reconciled this -- nothing was dropped
         sys.stdout.write(
-            f"[FALLBACK] webData2 saw an un-alerted size change on {coin}: "
+            f"[FALLBACK] [{state['label']}] webData2 saw an un-alerted size change on {coin}: "
             f"{confirmed} -> {new_szi} -- userFills likely dropped a fill. Synthesizing alert.\n"
         )
         sys.stdout.flush()
@@ -489,13 +532,15 @@ async def keep_alive_ping(ws: aiohttp.ClientWebSocketResponse):
 
 async def handle_websocket_stream(state: dict):
     entry_px_by_coin = state["entry_by_coin"]
+    label = state["label"]
+    address = state["address"]
 
     async with aiohttp.ClientSession() as session:
-        sys.stdout.write("[INFO] Connecting to Hyperliquid WebSocket Pipeline...\n")
+        sys.stdout.write(f"[INFO] [{label}] Connecting to Hyperliquid WebSocket Pipeline...\n")
         sys.stdout.flush()
 
         async with session.ws_connect(HYPERLIQUID_WS_URL) as ws:
-            sys.stdout.write("[INFO] WebSocket Pipeline Connected Successfully!\n")
+            sys.stdout.write(f"[INFO] [{label}] WebSocket Pipeline Connected Successfully!\n")
             sys.stdout.flush()
 
             # userFills gives instant per-fill alerts; webData2 runs alongside both to
@@ -504,13 +549,13 @@ async def handle_websocket_stream(state: dict):
             # above, which catches any fill userFills itself failed to deliver.
             await ws.send_json({
                 "method": "subscribe",
-                "subscription": {"type": "userFills", "user": TARGET_ADDRESS}
+                "subscription": {"type": "userFills", "user": address}
             })
             await ws.send_json({
                 "method": "subscribe",
-                "subscription": {"type": "webData2", "user": TARGET_ADDRESS}
+                "subscription": {"type": "webData2", "user": address}
             })
-            sys.stdout.write(f"[INFO] Streaming userFills + webData2 for address: {TARGET_ADDRESS}\n")
+            sys.stdout.write(f"[INFO] [{label}] Streaming userFills + webData2 for address: {address}\n")
             sys.stdout.flush()
 
             # Spawn the concurrent background task keeping the connection open
@@ -551,7 +596,7 @@ async def handle_websocket_stream(state: dict):
                                 newest = max(fills, key=_fill_key)
                                 state["last_fill_time"], state["last_fill_tid"] = _fill_key(newest)
                             sys.stdout.write(
-                                f"[INFO] Baseline fill history received: {len(fills)} fill(s)\n"
+                                f"[INFO] [{label}] Baseline fill history received: {len(fills)} fill(s)\n"
                             )
                             sys.stdout.flush()
                             save_state(state)
@@ -570,13 +615,15 @@ async def handle_websocket_stream(state: dict):
                         )
                         if is_snapshot and new_fills:
                             sys.stdout.write(
-                                f"[INFO] Reconnect snapshot contained {len(new_fills)} fill(s) "
-                                f"newer than our last watermark -- alerting on them now.\n"
+                                f"[INFO] [{label}] Reconnect snapshot contained {len(new_fills)} "
+                                f"fill(s) newer than our last watermark -- alerting on them now.\n"
                             )
                             sys.stdout.flush()
 
                         for fill in new_fills:
-                            alert_text = build_fill_alert(fill, entry_px_by_coin, state["mark_by_coin"])
+                            alert_text = build_fill_alert(
+                                fill, entry_px_by_coin, state["mark_by_coin"], label, address
+                            )
                             await send_telegram_message(session, alert_text)
 
                             state["last_fill_time"], state["last_fill_tid"] = _fill_key(fill)
@@ -600,8 +647,11 @@ async def handle_websocket_stream(state: dict):
                 for task in state["pending_fallback"].values():
                     task.cancel()
 
-async def main():
-    state = new_tracker_state()
+async def track_wallet(label: str, address: str):
+    """Runs the full connect/stream/reconnect lifecycle for one wallet, forever. Each
+    tracked wallet gets its own state (and thus its own state file, avg-entry/mark caches,
+    fill watermark, etc) -- one wallet's disconnects or dropped fills never affect another's."""
+    state = new_tracker_state(label, address)
     backoff = RECONNECT_BASE_DELAY
 
     while True:
@@ -614,12 +664,32 @@ async def main():
         except Exception as e:
             jittered_delay = backoff * random.uniform(0.8, 1.2)
             sys.stderr.write(
-                f"[ERROR] WebSocket disconnected: {str(e)}. "
+                f"[ERROR] [{label}] WebSocket disconnected: {str(e)}. "
                 f"Reconnecting in {jittered_delay:.1f}s (exponential backoff)...\n"
             )
             sys.stderr.flush()
             await asyncio.sleep(jittered_delay)
             backoff = min(RECONNECT_MAX_DELAY, backoff * 2)
+
+
+async def main():
+    wallets = get_tracked_wallets()
+    if not wallets:
+        sys.stderr.write(
+            "[ERROR] No wallets configured. Set HYPERLIQUID_WALLET_ADDRESS (or "
+            "WALLET_1_ADDRESS) at minimum.\n"
+        )
+        sys.stderr.flush()
+        sys.exit(1)
+
+    sys.stdout.write(
+        "[INFO] Tracking wallets: "
+        + ", ".join(f"{w['label']} ({w['address']})" for w in wallets)
+        + "\n"
+    )
+    sys.stdout.flush()
+
+    await asyncio.gather(*(track_wallet(w["label"], w["address"]) for w in wallets))
 
 if __name__ == "__main__":
     try:
