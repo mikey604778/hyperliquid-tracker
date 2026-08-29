@@ -39,31 +39,46 @@ def get_tracked_wallets() -> list[dict]:
     """Reads the list of wallets to track from environment variables: WALLET_<N>_LABEL /
     WALLET_<N>_ADDRESS for N = 1, 2, 3, ... stopping at the first missing address. Slot 1
     falls back to the legacy HYPERLIQUID_WALLET_ADDRESS var (and "Medium Whale 1" as its
-    label) so existing Railway configs keep working unchanged. Slots 2 and 3 default to
-    addresses the user asked to add ("Big Whale 2", "Whale 3") if WALLET_2_ADDRESS /
-    WALLET_3_ADDRESS aren't set, so they work immediately without a Railway variable --
-    add those vars on Railway too if you want them configurable without a code change
-    later."""
+    label) so existing Railway configs keep working unchanged. Slot 2 defaults to the
+    address the user asked to add ("Big Whale 2") if WALLET_2_ADDRESS isn't set, so it
+    works immediately without a Railway variable -- add that var on Railway too if you
+    want it configurable without a code change later.
+
+    A slot-3 default duplicating slot 1's address (0x833b99b2...db06, "Whale 3") briefly
+    existed here and caused that wallet to alert twice under two different labels for the
+    same trades -- removed. Every tracked address must be unique; add a genuinely new
+    address via WALLET_3_ADDRESS/WALLET_3_LABEL (env vars only, no default) if a third
+    wallet is wanted."""
     wallets = []
 
     default_addresses = {
         1: os.environ.get("HYPERLIQUID_WALLET_ADDRESS"),
         2: "0x418aa6bf98a2b2bc93779f810330d88cde488888",
-        3: "0x833b99b27dac651d02080f5e220e929df891db06",
     }
     default_labels = {
         1: "Medium Whale 1",
         2: "Big Whale 2",
-        3: "Whale 3",
     }
 
+    seen_addresses = {}
     n = 1
     while True:
         address = os.environ.get(f"WALLET_{n}_ADDRESS", default_addresses.get(n))
         if not address:
             break
         label = os.environ.get(f"WALLET_{n}_LABEL", default_labels.get(n, f"Whale {n}"))
-        wallets.append({"label": label, "address": address})
+
+        normalized = address.lower()
+        if normalized in seen_addresses:
+            sys.stderr.write(
+                f"[WARN] Skipping WALLET_{n} ({label}): address {address} is already "
+                f"tracked as '{seen_addresses[normalized]}'. Would have caused duplicate "
+                f"alerts for the same trades.\n"
+            )
+            sys.stderr.flush()
+        else:
+            seen_addresses[normalized] = label
+            wallets.append({"label": label, "address": address})
         n += 1
 
     return wallets
