@@ -366,9 +366,14 @@ def build_fill_alert(
 
     pnl_icon = "✅" if closed_pnl >= 0 else "❌"
     pnl_sign = "+" if closed_pnl >= 0 else "-"
+    pnl_basis = avg_entry * sz
+    pnl_pct = (closed_pnl / pnl_basis) * 100 if pnl_basis else 0.0
 
     line2 = f"{md_escape(action_text)} by {md_escape(_fmt_num(sz))} @ ${md_escape(_fmt_num(px))}"
-    line3 = f"Closed PNL: {pnl_sign}${md_escape(_fmt_num(abs(closed_pnl)))} {pnl_icon}"
+    line3 = (
+        f"Closed PNL: {pnl_sign}${md_escape(_fmt_num(abs(closed_pnl), 2))} "
+        f"\\({pnl_sign}{md_escape(_fmt_num(abs(pnl_pct), 2))}%\\) {pnl_icon}"
+    )
     line4 = (
         f"Remaining Size: {md_escape(_fmt_num(remaining_size))} "
         f"\\({md_escape(_fmt_usd(notional))}\\) \\| "
@@ -414,9 +419,14 @@ def build_fallback_alert(coin: str, old_szi: float, new_szi: float, state: dict)
         action_text = f"{'Closed' if is_full_close else 'Reduced'} {coin} {side_word}"
         pnl_icon = "✅" if pnl >= 0 else "❌"
         pnl_sign = "+" if pnl >= 0 else "-"
+        pnl_basis = avg_entry * size_closed
+        pnl_pct = (pnl / pnl_basis) * 100 if pnl_basis else 0.0
         notional = abs(new_szi * mark_px)
         line2 = f"{md_escape(action_text)} by {md_escape(_fmt_num(size_closed))} @ ${md_escape(_fmt_num(mark_px))}"
-        line3 = f"Closed PNL: {pnl_sign}${md_escape(_fmt_num(abs(pnl)))} {pnl_icon}"
+        line3 = (
+            f"Closed PNL: {pnl_sign}${md_escape(_fmt_num(abs(pnl), 2))} "
+            f"\\({pnl_sign}{md_escape(_fmt_num(abs(pnl_pct), 2))}%\\) {pnl_icon}"
+        )
         line4 = (
             f"Remaining Size: {md_escape(_fmt_num(abs(new_szi)))} "
             f"\\({md_escape(_fmt_usd(notional))}\\) \\| "
@@ -449,8 +459,13 @@ def build_fallback_alert(coin: str, old_szi: float, new_szi: float, state: dict)
         pnl = (mark_px - avg_entry) * abs(old_szi) * dir_factor
         pnl_icon = "✅" if pnl >= 0 else "❌"
         pnl_sign = "+" if pnl >= 0 else "-"
+        pnl_basis = avg_entry * abs(old_szi)
+        pnl_pct = (pnl / pnl_basis) * 100 if pnl_basis else 0.0
         line2 = f"{md_escape(f'Closed {coin} {side_word}')} by {md_escape(_fmt_num(abs(old_szi)))} @ ${md_escape(_fmt_num(mark_px))}"
-        line3 = f"Closed PNL: {pnl_sign}${md_escape(_fmt_num(abs(pnl)))} {pnl_icon}"
+        line3 = (
+            f"Closed PNL: {pnl_sign}${md_escape(_fmt_num(abs(pnl), 2))} "
+            f"\\({pnl_sign}{md_escape(_fmt_num(abs(pnl_pct), 2))}%\\) {pnl_icon}"
+        )
         line4 = "Remaining Size: 0 \\(\\$0\\.00\\) \\| Avg Entry: " + f"${md_escape(_fmt_num(avg_entry))}"
         return f"{line1}\n{line2}\n{line3}\n{line4}"
 
