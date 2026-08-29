@@ -90,6 +90,21 @@ async def send_telegram_message(session: aiohttp.ClientSession, msg: str):
                 resp_text = await response.text()
                 sys.stderr.write(f"Telegram API Error: {response.status} - {resp_text}\n")
                 sys.stderr.flush()
+                if response.status == 400:
+                    # A malformed MarkdownV2 payload (e.g. an unescaped reserved character
+                    # that slipped past md_escape) makes Telegram reject the whole message
+                    # with 400 -- otherwise it just silently never appears in the chat, with
+                    # no trace beyond this stderr line. Retry once as plain text so the alert
+                    # still reaches the chat instead of vanishing.
+                    fallback_payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
+                    async with session.post(url, json=fallback_payload, timeout=10) as retry:
+                        if retry.status != 200:
+                            retry_text = await retry.text()
+                            sys.stderr.write(
+                                f"Telegram API Error (plain-text retry also failed): "
+                                f"{retry.status} - {retry_text}\n"
+                            )
+                            sys.stderr.flush()
     except Exception as e:
         sys.stderr.write(f"Network Error sending to Telegram: {str(e)}\n")
         sys.stderr.flush()
@@ -374,8 +389,8 @@ def build_fill_alert(
 
     line2 = f"{md_escape(action_text)} by {md_escape(_fmt_num(sz))} @ ${md_escape(_fmt_num(px))}"
     line3 = (
-        f"Closed PNL: {pnl_sign}${md_escape(_fmt_num(abs(closed_pnl), 2))} "
-        f"\\({pnl_sign}{md_escape(_fmt_num(abs(pnl_pct), 2))}%\\) {pnl_icon}"
+        f"Closed PNL: {md_escape(pnl_sign)}${md_escape(_fmt_num(abs(closed_pnl), 2))} "
+        f"\\({md_escape(pnl_sign)}{md_escape(_fmt_num(abs(pnl_pct), 2))}%\\) {pnl_icon}"
     )
     line4 = (
         f"Remaining Size: {md_escape(_fmt_num(remaining_size))} "
@@ -427,8 +442,8 @@ def build_fallback_alert(coin: str, old_szi: float, new_szi: float, state: dict)
         notional = abs(new_szi * mark_px)
         line2 = f"{md_escape(action_text)} by {md_escape(_fmt_num(size_closed))} @ ${md_escape(_fmt_num(mark_px))}"
         line3 = (
-            f"Closed PNL: {pnl_sign}${md_escape(_fmt_num(abs(pnl), 2))} "
-            f"\\({pnl_sign}{md_escape(_fmt_num(abs(pnl_pct), 2))}%\\) {pnl_icon}"
+            f"Closed PNL: {md_escape(pnl_sign)}${md_escape(_fmt_num(abs(pnl), 2))} "
+            f"\\({md_escape(pnl_sign)}{md_escape(_fmt_num(abs(pnl_pct), 2))}%\\) {pnl_icon}"
         )
         line4 = (
             f"Remaining Size: {md_escape(_fmt_num(abs(new_szi)))} "
@@ -466,8 +481,8 @@ def build_fallback_alert(coin: str, old_szi: float, new_szi: float, state: dict)
         pnl_pct = (pnl / pnl_basis) * 100 if pnl_basis else 0.0
         line2 = f"{md_escape(f'Closed {coin} {side_word}')} by {md_escape(_fmt_num(abs(old_szi)))} @ ${md_escape(_fmt_num(mark_px))}"
         line3 = (
-            f"Closed PNL: {pnl_sign}${md_escape(_fmt_num(abs(pnl), 2))} "
-            f"\\({pnl_sign}{md_escape(_fmt_num(abs(pnl_pct), 2))}%\\) {pnl_icon}"
+            f"Closed PNL: {md_escape(pnl_sign)}${md_escape(_fmt_num(abs(pnl), 2))} "
+            f"\\({md_escape(pnl_sign)}{md_escape(_fmt_num(abs(pnl_pct), 2))}%\\) {pnl_icon}"
         )
         line4 = "Remaining Size: 0 \\(\\$0\\.00\\) \\| Avg Entry: " + f"${md_escape(_fmt_num(avg_entry))}"
         return f"{line1}\n{line2}\n{line3}\n{line4}"
